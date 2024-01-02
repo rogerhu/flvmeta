@@ -21,8 +21,9 @@
 */
 #include <stdio.h>
 #include <stdlib.h>
-#include "flv.h"
+#include <string.h>
 
+#include "flv.h"
 #include "types.h"
 
 int read_hevc_resolution(flv_video_tag * vt, flv_stream * f, uint32 body_length, uint32 * width, uint32 * height);

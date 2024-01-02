@@ -102,6 +102,168 @@ static int read_hevc_decoder_configuration_record(flv_stream * f, HEVCDecoderCon
 
 #define HEVC_NAL_SPS 33
 #define AP4_ATOM_HEADER_SIZE 8*8
+#define AV_INPUT_BUFFER_PADDING_SIZE 64
+
+typedef struct H2645NAL {
+    const uint8_t *data;
+    int size;
+
+    /**
+     * Size, in bits, of just the data, excluding the stop bit and any trailing
+     * padding. I.e. what HEVC calls SODB.
+     */
+    int size_bits;
+
+    int raw_size;
+    const uint8_t *raw_data;
+
+    bit_buffer gb;
+
+    /**
+     * NAL unit type
+     */
+    int type;
+
+    /**
+     * H.264 only, nal_ref_idc
+     */
+    int ref_idc;
+
+    /**
+     * HEVC only, nuh_temporal_id_plus_1 - 1
+     */
+    int temporal_id;
+
+    /*
+     * HEVC only, identifier of layer to which nal unit belongs
+     */
+    int nuh_layer_id;
+
+    int skipped_bytes;
+    int skipped_bytes_pos_size;
+    int *skipped_bytes_pos;
+} H2645NAL;
+
+typedef struct H2645RBSP {
+    uint8_t *rbsp_buffer;
+//    AVBufferRef *rbsp_buffer_ref;
+    int rbsp_buffer_alloc_size;
+    int rbsp_buffer_size;
+} H2645RBSP;
+
+int ff_h2645_extract_rbsp(const uint8_t *src, int length,
+                          H2645RBSP *rbsp, H2645NAL *nal, int small_padding)
+{
+    int i, si, di;
+    uint8_t *dst;
+
+    nal->skipped_bytes = 0;
+#define STARTCODE_TEST                                                  \
+        if (i + 2 < length && src[i + 1] == 0 && src[i + 2] <= 3) {     \
+            if (src[i + 2] != 3 && src[i + 2] != 0) {                   \
+                /* startcode, so we must be past the end */             \
+                length = i;                                             \
+            }                                                           \
+            break;                                                      \
+        }
+#if HAVE_FAST_UNALIGNED
+#define FIND_FIRST_ZERO                                                 \
+        if (i > 0 && !src[i])                                           \
+            i--;                                                        \
+        while (src[i])                                                  \
+            i++
+#if HAVE_FAST_64BIT
+    for (i = 0; i + 1 < length; i += 9) {
+        if (!((~AV_RN64(src + i) &
+               (AV_RN64(src + i) - 0x0100010001000101ULL)) &
+              0x8000800080008080ULL))
+            continue;
+        FIND_FIRST_ZERO;
+        STARTCODE_TEST;
+        i -= 7;
+    }
+#else
+    for (i = 0; i + 1 < length; i += 5) {
+        if (!((~AV_RN32(src + i) &
+               (AV_RN32(src + i) - 0x01000101U)) &
+              0x80008080U))
+            continue;
+        FIND_FIRST_ZERO;
+        STARTCODE_TEST;
+        i -= 3;
+    }
+#endif /* HAVE_FAST_64BIT */
+#else
+    for (i = 0; i + 1 < length; i += 2) {
+        if (src[i])
+            continue;
+        if (i > 0 && src[i - 1] == 0)
+            i--;
+        STARTCODE_TEST;
+    }
+#endif /* HAVE_FAST_UNALIGNED */
+
+    if (i >= length - 1 && small_padding) { // no escaped 0
+        nal->data     =
+        nal->raw_data = src;
+        nal->size     =
+        nal->raw_size = length;
+        return length;
+    } else if (i > length)
+        i = length;
+
+    dst = &rbsp->rbsp_buffer[rbsp->rbsp_buffer_size];
+
+    memcpy(dst, src, i);
+    si = di = i;
+    while (si + 2 < length) {
+        // remove escapes (very rare 1:2^22)
+        if (src[si + 2] > 3) {
+            dst[di++] = src[si++];
+            dst[di++] = src[si++];
+        } else if (src[si] == 0 && src[si + 1] == 0 && src[si + 2] != 0) {
+            if (src[si + 2] == 3) { // escape
+                dst[di++] = 0;
+                dst[di++] = 0;
+                si       += 3;
+
+                // if (nal->skipped_bytes_pos) {
+                //     nal->skipped_bytes++;
+                //     if (nal->skipped_bytes_pos_size < nal->skipped_bytes) {
+                //         nal->skipped_bytes_pos_size *= 2;
+                //         av_assert0(nal->skipped_bytes_pos_size >= nal->skipped_bytes);
+                //         av_reallocp_array(&nal->skipped_bytes_pos,
+                //                 nal->skipped_bytes_pos_size,
+                //                 sizeof(*nal->skipped_bytes_pos));
+                //         if (!nal->skipped_bytes_pos) {
+                //             nal->skipped_bytes_pos_size = 0;
+                //             return AVERROR(ENOMEM);
+                //         }
+                //     }
+                //     if (nal->skipped_bytes_pos)
+                //         nal->skipped_bytes_pos[nal->skipped_bytes-1] = di - 1;
+                // }
+                continue;
+            } else // next start code
+                goto nsc;
+        }
+
+        dst[di++] = src[si++];
+    }
+    while (si < length)
+        dst[di++] = src[si++];
+
+nsc:
+    memset(dst + di, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+
+    nal->data = dst;
+    nal->size = di;
+    nal->raw_data = src;
+    nal->raw_size = si;
+    rbsp->rbsp_buffer_size += si;
+
+    return si;
+}
 
 static void hvcc_parse_sps(byte * sps, size_t sps_size, uint32 * width, uint32 * height) {
     bit_buffer bb;
@@ -116,18 +278,36 @@ static void hvcc_parse_sps(byte * sps, size_t sps_size, uint32 * width, uint32 *
     bb.current = sps;
     bb.read_bits = 0;
 
-    skip_bits(&bb, 4); // sps_video_parameter_set_id
+    uint8_t unit_type;
+    //  nal->type = get_bits(gb, 6);
 
-    if (exp_golomb_ue(&bb) == 3) {
-            skip_bits(&bb, 1);
-    }
-    /* bit depth luma minus8 */
-    pic_width_in_luma_samples = exp_golomb_ue(&bb);
-    /* bit depth chroma minus8 */
-    pic_length_in_luma_samples = exp_golomb_ue(&bb);
+    // nal->nuh_layer_id = get_bits(gb, 6);
+    // nal->temporal_id = get_bits(gb, 3) - 1;
 
-    *width = (pic_width_in_luma_samples + 1) * 16;
-    *height = (pic_length_in_luma_samples + 1) * 16;
+    // skip_bits(&bb, 1);
+    // get_bits(&bb, 6, &unit_type);
+
+
+    // uint8_t vps_id, max_sub_layers, temporal_id_nesting_flag;
+    // uint8_t sps_id, chroma_format_idc;
+
+    // skip_bits(&bb, 16);
+    // get_bits(&bb, 4, &vps_id); // VPS ID
+    // get_bits(&bb, 3, &max_sub_layers);
+    // max_sub_layers += 1;
+    // get_bits(&bb, 1, &temporal_id_nesting_flag);
+
+    // sps_id = exp_golomb_ue(&bb);
+    // chroma_format_idc = exp_golomb_ue(&bb);
+
+    // if (chroma_format_idc == 3) {
+    //     skip_bits(&bb, 1); // separate_colour_plane_flag
+    // }
+
+    skip_bits(&bb, 124);
+ // 124
+    *width = exp_golomb_ue(&bb);
+    *height = exp_golomb_ue(&bb);
 
     // if (!get_bits(&bb, 3, &sps_max_sub_layers_minus1)) {
     //     return;
@@ -212,7 +392,6 @@ int read_hevc_resolution(flv_video_tag * vt, flv_stream * f, uint32 body_length,
     //     return FLV_ERROR_EOF;
     // }
 
-
     if (flv_read_tag_body(f, &hvccHeader, sizeof(hvccHeader)) < sizeof(hvccHeader)) {
         return FLV_ERROR_EOF;
     }
@@ -222,41 +401,66 @@ int read_hevc_resolution(flv_video_tag * vt, flv_stream * f, uint32 body_length,
     hvccAtom.lengthSizeMinusOne = (hvccHeader[21] & 0x03) + 1;
     hvccAtom.numOfArrays = hvccHeader[22];
 
-    int i, j;
-    HVCCNALUnitArray unitArray;
-    uint16_be numNalus;
+    int i, j, k;
+    uint8 nal_unit_type;
+    uint16_be numNalus, nalUnitLength;
 
     for (i = 0; i < hvccAtom.numOfArrays; i++) {
-        if (flv_read_tag_body(f, &unitArray.NAL_unit_type, 1) < 1) {
+
+        if (flv_read_tag_body(f, &nal_unit_type, 1) < 1) {
             return FLV_ERROR_EOF;
         }
         if (flv_read_tag_body(f, &numNalus, 2) < 2) {
             return FLV_ERROR_EOF;
         }
 
-        int unitType = unitArray.NAL_unit_type & 0x3F;
+        int unitType = nal_unit_type & 0x3F;
         int nalCount = swap_uint16(numNalus);
         int nalLengthSize = 2; /* hvcc always contains 2 */
-        unitArray.nalUnitLength = malloc(nalCount * sizeof(uint16));
-        byte *buf;
+        byte *buf, *buf2;
 
         // https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/hevc_parse.c#L80
         for (j = 0; j < nalCount; j++) {
-            if (flv_read_tag_body(f, &unitArray.nalUnitLength[j], 2) < 2) {
+            if (flv_read_tag_body(f, &nalUnitLength, 2) < 2) {
                 return FLV_ERROR_EOF;
             }
-            unitArray.nalUnitLength[j] = swap_uint16(unitArray.nalUnitLength[j]);
+            nalUnitLength = swap_uint16(nalUnitLength);
 
             // Skip over the first NALU
-            buf = malloc(unitArray.nalUnitLength[j]);
-            if (flv_read_tag_body(f, buf, unitArray.nalUnitLength[j]) < unitArray.nalUnitLength[j]) {
+            buf = malloc(nalUnitLength);
+
+            if (flv_read_tag_body(f, buf, nalUnitLength) < nalUnitLength) {
                 return FLV_ERROR_EOF;
             }
 
             if (unitType == 33) {
                 /* parse SPS to determine video resolution */
-                hvcc_parse_sps(buf, unitArray.nalUnitLength[j], width, height);
-                free(buf);
+                H2645RBSP h2645rbsp;
+                H2645NAL h2645nal;
+                h2645rbsp.rbsp_buffer_size = 0;
+                h2645rbsp.rbsp_buffer = malloc(nalUnitLength);
+                h2645rbsp.rbsp_buffer_alloc_size = nalUnitLength;
+
+                int consumed = ff_h2645_extract_rbsp(buf, nalUnitLength, &h2645rbsp, &h2645nal, 1);
+
+                hvcc_parse_sps(h2645nal.data, nalUnitLength, width, height);
+//                 for (k = 0; k < nalUnitLength; ) {
+//                     if((k + 2) < nalUnitLength &&
+//                        buf[k] == 0x00 && buf[k+1] == 0x00 && buf[k+2] == 0x03) {
+// //                        buf[k+2] = 0xAE; // skip this byte
+
+//                         int new_size = nalUnitLength - 1;
+//                         buf2 = malloc(new_size);
+//                         memcpy(buf2, buf, k+2); // copy over the first part
+//                         memcpy(buf2+k+2, buf+k+3, new_size - k - 3); // copy remianing part
+//                         hvcc_parse_sps(buf2, nalUnitLength, width, height);
+//                         free(buf);
+// //                        free(buf2);
+//                         return FLV_OK;
+//                     }
+//                     k += 1;
+//                 }
+                // free(buf);
                 return FLV_OK;
             }
             free(buf);
